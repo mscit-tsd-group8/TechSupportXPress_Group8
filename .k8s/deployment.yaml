@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
         - name: techsupportxpress
-          image: $GCR_REGISTRY/$GCP_PROJECT_ID/$DOCKER_IMAGE_NAME:$IMAGE_TAG  # Dynamic image tag
+          image: gcr.io/seraphic-hawk-452303-s6/techsupportxpress:b38e309
           ports:
             - containerPort: 8080
           env:
@@ -62,4 +62,3 @@ spec:
       port: 80
       targetPort: 8080
   type: NodePort
-

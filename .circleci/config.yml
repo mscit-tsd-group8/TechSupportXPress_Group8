@@ -12,49 +12,200 @@ jobs:
       - image: circleci/python:3.8
     steps:
       - checkout
+      - setup_remote_docker
       - run:
           name: Set up Docker
           command: |
             docker version
             docker info
       - run:
+          name: Debug Environment Variables
+          command: |
+            echo "GCR_REGISTRY: $GCR_REGISTRY"
+            echo "GCP_PROJECT_ID: $GCP_PROJECT_ID"
+            echo "DOCKER_IMAGE_NAME: $DOCKER_IMAGE_NAME"
+            echo "IMAGE_TAG: $IMAGE_TAG"
+      
+      - run:
           name: Build Docker Image
           command: |
-            IMAGE_TAG=$(git rev-parse --short HEAD)  # Get short Git commit hash
-            docker build -t $GCR_REGISTRY/$GCP_PROJECT_ID/$DOCKER_IMAGE_NAME:$IMAGE_TAG .
+            IMAGE_TAG=$(git rev-parse --short HEAD)
+            echo "Using IMAGE_TAG: $IMAGE_TAG"
+            echo "IMAGE_TAG=$IMAGE_TAG" >> $BASH_ENV  # ✅ Store it for later steps
+            source $BASH_ENV  # ✅ Ensure it's available
+            docker build -t gcr.io/$GCP_PROJECT_ID/$DOCKER_IMAGE_NAME:$IMAGE_TAG .
+
+      - run:
+          name: Install Google Cloud SDK and authenticate
+          command: |
+            # Download and install Google Cloud SDK
+            curl https://dl.google.com/dl/cloudsdk/release/google-cloud-sdk.tar.gz > /tmp/google-cloud-sdk.tar.gz
+            mkdir -p $HOME/gcloud
+            tar -C $HOME/gcloud -xvf /tmp/google-cloud-sdk.tar.gz
+            $HOME/gcloud/google-cloud-sdk/install.sh --quiet
+
+            # Add gcloud to PATH
+            echo "export PATH=\$PATH:$HOME/gcloud/google-cloud-sdk/bin" >> $BASH_ENV
+            source $BASH_ENV
+
+      - run:
+          name: Authenticate with Google Cloud
+          command: |
+            echo $GCLOUD_SERVICE_KEY | base64 --decode > $HOME/gcloud-service-key.json
+            gcloud auth activate-service-account --key-file=$HOME/gcloud-service-key.json
+            gcloud auth configure-docker gcr.io
+
       - run:
           name: Push Docker Image
           command: |
-            docker push $GCR_REGISTRY/$GCP_PROJECT_ID/$DOCKER_IMAGE_NAME:$IMAGE_TAG
-            echo "IMAGE_TAG=$IMAGE_TAG" >> $BASH_ENV  # Make the image tag available for subsequent jobs
+            source $BASH_ENV  # ✅ Load stored variables
+            echo "Pushing image: gcr.io/$GCP_PROJECT_ID/$DOCKER_IMAGE_NAME:$IMAGE_TAG"
+            docker push gcr.io/$GCP_PROJECT_ID/$DOCKER_IMAGE_NAME:$IMAGE_TAG
+
+  update_k8s:
+    docker:
+      - image: circleci/python:3.8
+    steps:
+      - checkout       
+      - run:
+          name: Install JQ and YQ
+          command: |
+            # Install JQ
+            wget -O jq https://github.com/jqlang/jq/releases/download/jq-1.6/jq-linux64
+            chmod +x ./jq
+            mkdir -p $HOME/bin
+            mv jq $HOME/bin/
+            echo "export PATH=\$HOME/bin:\$PATH" >> $BASH_ENV  # Correctly add $HOME/bin to $PATH
+            source $BASH_ENV  # Source the updated $BASH_ENV
+            echo "Checking jq version"
+            jq --version
+
+            # Install YQ
+            wget https://github.com/mikefarah/yq/releases/download/v4.34.1/yq_linux_amd64.tar.gz -O - |
+                tar xz && mv yq_linux_amd64 $HOME/bin/yq
+            echo "export PATH=\$HOME/bin:\$PATH" >> $BASH_ENV  # Ensure yq is in the PATH
+            source $BASH_ENV  # Source the updated $BASH_ENV again
+            echo "Checking yq version"
+            yq --version
+
+      - run:
+          name: Check if .k8s/deployment.yaml exists
+          command: |
+            ls -l ./.k8s/deployment.yaml
+            echo "File exists and ready for parsing."
+
+      - run:
+          name: Debug and update deployment.yaml
+          command: |
+            IMAGE_TAG=$(git rev-parse --short HEAD)
+            echo "Latest IMAGE_TAG: $IMAGE_TAG"
+
+
+            # Extract current image path
+            IMAGE_PATH=$(yq eval '.spec.template.spec.containers[0].image' ./.k8s/deployment.yaml)
+            echo "Current IMAGE_PATH after yq eval: $IMAGE_PATH"
+
+            if [[ -z "$IMAGE_PATH" || "$IMAGE_PATH" == "null" ]]; then
+              echo "ERROR: IMAGE_PATH is empty or null. Check your .k8s/deployment.yaml file."
+              exit 1
+            fi
+
+            # Correct image path formatting
+            NEW_IMAGE_PATH="gcr.io/seraphic-hawk-452303-s6/techsupportxpress:${IMAGE_TAG}"
+            echo "Updating deployment.yaml with image path: $NEW_IMAGE_PATH"
+
+            # Update the deployment.yaml file
+            # yq eval -i '
+            # (select(.kind == "Deployment") .spec.template.spec.containers[0].image) = "'"$NEW_IMAGE_PATH"'"
+            # ' ./.k8s/deployment.yaml
+
+            export DEPLOYMENT_NAME=$(yq eval 'select(.kind == "Deployment") | .metadata.name' ./.k8s/deployment.yaml)
+
+            yq eval -i '
+              (select(.kind == "Deployment") |
+                with(.spec.template.spec.containers[]; 
+                  select(.name == env(DEPLOYMENT_NAME)).image = "'"$NEW_IMAGE_PATH"'"
+                )
+              ) // .
+            ' ./.k8s/deployment.yaml
+
+            echo "Validating updated deployment.yaml"
+            if ! yq eval . ./.k8s/deployment.yaml >/dev/null 2>&1; then
+              echo "ERROR: Invalid YAML syntax in deployment.yaml"
+              exit 1
+            fi
+
+            echo "Updated deployment.yaml:"
+            cat ./.k8s/deployment.yaml
+
+      - persist_to_workspace:
+          root: ./
+          paths:
+            - .k8s/deployment.yaml     
+
+
+
+
 
   deploy:
     docker:
-      - image: google/cloud-sdk:alpine
+      - image: gcr.io/google.com/cloudsdktool/cloud-sdk:latest
     steps:
       - checkout
+
+      - attach_workspace:
+          at: ./
+
+      - run:
+          name: Install kubectl
+          command: |
+            curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+            chmod +x kubectl
+            mv kubectl /usr/local/bin/
+
+      - run:
+          name: Install gke-gcloud-auth-plugin
+          command: |
+            apt-get update && apt-get install -y google-cloud-cli-gke-gcloud-auth-plugin
+
       - run:
           name: Set up Google Cloud credentials
           command: |
-            echo $GCLOUD_SERVICE_KEY | base64 --decode > $HOME/gcloud-service-key.json
+            echo $GCLOUD_SERVICE_KEY | base64 -d > $HOME/gcloud-service-key.json
             gcloud auth activate-service-account --key-file=$HOME/gcloud-service-key.json
             gcloud config set project $GCP_PROJECT_ID
             gcloud config set compute/zone $COMPUTE_ZONE
             gcloud config set container/cluster $GKE_CLUSTER_NAME
             gcloud container clusters get-credentials $GKE_CLUSTER_NAME
+            export USE_GKE_GCLOUD_AUTH_PLUGIN=True
+            echo "export USE_GKE_GCLOUD_AUTH_PLUGIN=True" >> $BASH_ENV
+            echo "export K8S_DEPLOYMENT_PATH='./.k8s'" >> $BASH_ENV
+            source $BASH_ENV
+
+      - run:
+              name: Debug and verify deployment.yaml before deployment
+              command: |
+                echo "Deployment.yaml before kubectl apply:"
+                cat ./.k8s/deployment.yaml
+
       - run:
           name: Deploy to GKE
           command: |
-            IMAGE_TAG=$IMAGE_TAG  # Retrieve the image tag from the build job
-            kubectl set image deployment/techsupportxpress techsupportxpress=$GCR_REGISTRY/$GCP_PROJECT_ID/$DOCKER_IMAGE_NAME:$IMAGE_TAG
-            kubectl apply -f $K8S_DEPLOYMENT_PATH/deployment.yaml
+            kubectl apply -f ./.k8s/deployment.yaml
 
 workflows:
   version: 2
   build-deploy:
     jobs:
-      - build
-      - deploy:
+      - build:
+          context: devcontext
+      - update_k8s:
           requires:
             - build
-
+      - deploy:
+          requires:
+            - update_k8s
+          filters:
+            branches:
+              only: develop
+          context: devcontext
